@@ -1,0 +1,31 @@
+{
+  "name": "gcov-parse",
+  "version": "1.0.0",
+  "description": "Parse GCOV .gcda and .gcno files",
+  "main": "out/src/gcov.js",
+  "scripts": {
+    "build": "tsc",
+    "lint": "tslint -p tsconfig.json",
+    "test": "tsc && mocha -u tdd out/tests/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OlegKunitsyn/gcov-parse.git"
+  },
+  "keywords": [
+    "gcov",
+    "coverage"
+  ],
+  "author": "Olegs Kunicins",
+  "license": "EPL-2.0",
+  "engines": {
+    "node": ">= 8.0.0"
+  },
+  "devDependencies": {
+    "@types/mocha": "^8.2.0",
+    "@types/node": "^14.14.14",
+    "mocha": "^8.2.1",
+    "tslint": "^6.1.3",
+    "typescript": "^4.1.3"
+  }
+}

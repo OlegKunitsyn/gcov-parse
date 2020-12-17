@@ -1,0 +1,12 @@
+{
+	"defaultSeverity": "error",
+	"extends": "tslint:recommended",
+	"rules": {
+		"indent": [true, "spaces"],
+		"ban-types": false,
+		"max-classes-per-file": false,
+		"no-bitwise": false,
+		"only-arrow-functions": false,
+		"triple-equals": false
+	}
+}
