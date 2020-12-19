@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc",
     "lint": "tslint -p tsconfig.json",
-    "test": "tsc && mocha -u tdd out/tests/"
+    "test": "mocha -u tdd out/tests/"
   },
   "repository": {
     "type": "git",

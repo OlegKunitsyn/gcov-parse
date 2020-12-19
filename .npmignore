@@ -3,6 +3,7 @@
 .gitignore
 src/**
 tests/**
+resources/**
 out/tests/**
 tsconfig.json
 tslint.json
