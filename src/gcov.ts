@@ -6,15 +6,22 @@
  */
 import * as fs from "fs";
 
-export interface Coverage {
-    file: string;
+export interface CoverageLine {
     line: number;
     executed: boolean;
 }
 
+export interface Coverage {
+    file: string;
+    instrumented: number;
+    executed: number;
+    lines: CoverageLine[]
+}
+
 /**
- * Parse GCOV files and return Coverage
- * @param gcovFiles full path to the files, without trailing .gcda or .gcno
+ * Parse GCOV files and return Coverage array
+ * @throws Error
+ * @param gcovFiles full path to the files, without trailing .gcda/.gcno extension
  */
 export function parse(gcovFiles: string[]): Coverage[] {
     let gcdaRecordsParser: GcdaRecordsParser;
@@ -51,41 +58,58 @@ export function parse(gcovFiles: string[]): Coverage[] {
         gcdaRecordsParser.parse(stream);
     }
 
-    const coverages: Map<string, Coverage> = new Map<string, Coverage>();
+    // solve graph for each function
+    for (const f of gcnoFunctions) {
+        f.solveGraphFunction();
+    }
+
+    // allocate lines
     for (const sourceFile of sourceFiles) {
-        const linesCount = sourceFile.linesCount;
-        for (let j = 0; j < linesCount; j++) {
+        for (let j = 0; j < sourceFile.linesCount; j++) {
             sourceFile.lines.push(new Line());
         }
-        sourceFile.functions.forEach(function (gcnoFunction) {
-            for (const block of gcnoFunction.functionBlocks) {
-                for (const lineno of block.lineNumbers) {
+        sourceFile.functions.forEach((fn) => {
+            for (const block of fn.functionBlocks) {
+                if (block.blockLines == null) {
+                    continue;
+                }
+                for (let i = 2; i < block.blockLines.length; ++i) {
+                    const lineno = block.blockLines[i];
+                    if (lineno === 0)
+                        break;
                     const line: Line = sourceFile.lines[lineno];
                     line.blocks.add(block);
                 }
             }
-            gcnoFunction.solveGraphFunction();
-            gcnoFunction.addLineCounts(sourceFiles);
-        });
-
-        // coverage
-        for (const line of sourceFile.lines) {
-            if (!line.exists) {
-                continue;
-            }
-            line.blocks.forEach(function (block) {
-                for (const lineNum of block.lineNumbers) {
-                    coverages.set(`${sourceFile.name}${lineNum}`, {
-                        file: sourceFile.name,
-                        line: lineNum,
-                        executed: line.count > 0
-
-                    } as Coverage);
-                }
-            });
-        }
+        })
     }
-    return Array.from(coverages.values());
+
+    // add line counts
+    for (const f of gcnoFunctions) {
+        f.addLineCounts(sourceFiles);
+    }
+
+    // coverage
+    const coverages: Coverage[] = [];
+    for (const sourceFile of sourceFiles) {
+        const coverage: Coverage = {
+            file: sourceFile.name,
+            instrumented: 0,
+            executed: 0,
+            lines: []
+        }
+        for (let i = 0; i < sourceFile.lines.length; i++) {
+            if (sourceFile.lines[i].exists) {
+                coverage.instrumented++;
+                if (sourceFile.lines[i].count > 0) {
+                    coverage.executed++;
+                }
+                coverage.lines.push({line: i, executed: sourceFile.lines[i].count > 0} as CoverageLine);
+            }
+        }
+        coverages.push(coverage);
+    }
+    return coverages;
 }
 
 class Arc {
@@ -94,6 +118,7 @@ class Arc {
     readonly VCOV_ARC_FALLTHROUGH: number = (1 << 2);
     srcBlock: Block;
     dstBlock: Block;
+    isFake: boolean;
     isOnTree: boolean;
     count: number = 0;
     isValid: boolean = false;
@@ -101,14 +126,18 @@ class Arc {
     constructor(srcBlockIndex: number, dstBlockIndice: number, flag: number, otherArcParams: Block[]) {
         this.dstBlock = otherArcParams[dstBlockIndice];
         this.srcBlock = otherArcParams[srcBlockIndex];
-        if ((flag & this.VCOV_ARC_ON_TREE) != 0) {
+        if ((flag & this.VCOV_ARC_ON_TREE) !== 0) {
             this.isOnTree = true;
-        } else if ((flag & this.VCOV_ARC_FAKE) != 0) {
+            this.isFake = false;
+        } else if ((flag & this.VCOV_ARC_FAKE) !== 0) {
             this.isOnTree = false;
-        } else if ((flag & this.VCOV_ARC_FALLTHROUGH) != 0) {
+            this.isFake = true;
+        } else if ((flag & this.VCOV_ARC_FALLTHROUGH) !== 0) {
             this.isOnTree = false;
+            this.isFake = false;
         } else {
             this.isOnTree = false;
+            this.isFake = false;
         }
     }
 }
@@ -116,14 +145,15 @@ class Arc {
 class Block {
     entryArcs: Arc[] = [];
     exitArcs: Arc[] = [];
-    lineNumbers: number[] = [];
     successCount: number = 0;
     predictionsCount: number = 0;
     count: number = 0;
-    sourceIndex: number = 0;
+    isCallSite: boolean = false;
     isValidChain: boolean = false;
     isInvalidChain: boolean = false;
     countValid: boolean = false;
+    blockLines: number[] = [];
+    lineNumber: number = 0;
 }
 
 class Line {
@@ -191,6 +221,7 @@ class GcnoFunction {
     firstLineNumber: number;
     srcFile: string;
     functionBlocks: Block[] = [];
+    numBlocks: number = 0;
 
     constructor(ident: number, checksum: number, srcFile: string, firstLineNumber: number) {
         this.ident = ident;
@@ -200,21 +231,24 @@ class GcnoFunction {
     }
 
     public addLineCounts(sourceFiles: SourceFile[]): void {
-        const linesToCalculate: Set<Line> = new Set<Line>();
+        const linesToCalculate = [];
         for (const block of this.functionBlocks) {
             let sourceFile: SourceFile | null = null;
-            for (const file of sourceFiles) {
-                if (file.index == block.sourceIndex) {
-                    sourceFile = file;
-                    break;
-                }
-            }
-            for (const lineNumber of block.lineNumbers) {
-                if (sourceFile != null && lineNumber < sourceFile.lines.length) {
-                    const line = sourceFile.lines[lineNumber];
+            for (let j = 0, k = 0; j !== block.lineNumber; j++, k++) {
+                if (block.blockLines[k] === 0) {
+                    const blockLine = block.blockLines[++k];
+                    for (const file of sourceFiles) {
+                        if (file.index === blockLine) {
+                            sourceFile = file;
+                            break;
+                        }
+                    }
+                    j++;
+                } else if (sourceFile != null && block.blockLines[k] < sourceFile.lines.length) {
+                    const line = sourceFile.lines[block.blockLines[k]];
                     line.exists = true;
                     if (line.blocks.size > 1) {
-                        linesToCalculate.add(line);
+                        linesToCalculate.push(line);
                         line.count = 1;
                     } else {
                         line.count += block.count;
@@ -222,9 +256,9 @@ class GcnoFunction {
                 }
             }
         }
-        linesToCalculate.forEach(function (line: Line) {
+        for (const line of linesToCalculate) {
             let count = 0;
-            line.blocks.forEach(function (block: Block) {
+            line.blocks.forEach((block) => {
                 for (const arc of block.entryArcs) {
                     if (!line.blocks.has(arc.srcBlock)) {
                         count += arc.count;
@@ -232,7 +266,7 @@ class GcnoFunction {
                 }
                 line.count = count;
             });
-        });
+        }
     }
 
     public solveGraphFunction(): void {
@@ -240,10 +274,10 @@ class GcnoFunction {
         const invalidBlocks: Block[] = [];
 
         if (this.functionBlocks.length >= 2) {
-            if (this.functionBlocks[0].predictionsCount == 0) {
+            if (this.functionBlocks[0].predictionsCount === 0) {
                 this.functionBlocks[0].predictionsCount = 50000;
             }
-            if (this.functionBlocks[this.functionBlocks.length - 1].successCount == 0) {
+            if (this.functionBlocks[this.functionBlocks.length - 1].successCount === 0) {
                 this.functionBlocks[this.functionBlocks.length - 1].successCount = 50000;
             }
         }
@@ -260,16 +294,16 @@ class GcnoFunction {
                     let total = 0;
                     invalidBlocks.pop();
                     invalidBlock.isInvalidChain = false;
-                    if (invalidBlock.predictionsCount != 0 && invalidBlock.successCount != 0)
+                    if (invalidBlock.predictionsCount !== 0 && invalidBlock.successCount !== 0)
                         continue;
 
-                    if (invalidBlock.successCount == 0) {
+                    if (invalidBlock.successCount === 0) {
                         const exitArcs: Arc[] = invalidBlock.exitArcs;
                         for (const arc of exitArcs) {
                             total += arc.count;
                         }
                     }
-                    if (invalidBlock.predictionsCount == 0 && total == 0) {
+                    if (invalidBlock.predictionsCount === 0 && total === 0) {
                         const entryArcs: Arc[] = invalidBlock.entryArcs;
                         for (const arc of entryArcs) {
                             total += arc.count;
@@ -294,7 +328,7 @@ class GcnoFunction {
                     total = vb.count;
                     for (const extAr of vb.exitArcs) {
                         total -= extAr.count;
-                        if (extAr.isValid == false) {
+                        if (!extAr.isValid) {
                             invarc = extAr;
                         }
                     }
@@ -305,19 +339,19 @@ class GcnoFunction {
                     dstBlock.predictionsCount--;
 
                     if (dstBlock.countValid) {
-                        if (dstBlock.predictionsCount == 1 && !dstBlock.isValidChain) {
+                        if (dstBlock.predictionsCount === 1 && !dstBlock.isValidChain) {
                             dstBlock.isValidChain = true;
                             validBlocks.push(dstBlock);
                         }
                     } else {
-                        if (dstBlock.predictionsCount == 0 && !dstBlock.isInvalidChain) {
+                        if (dstBlock.predictionsCount === 0 && !dstBlock.isInvalidChain) {
                             dstBlock.isInvalidChain = true;
                             invalidBlocks.push(dstBlock);
                         }
                     }
                 }
 
-                if (vb.predictionsCount == 1) {
+                if (vb.predictionsCount === 1) {
                     let blcksrc: Block;
                     total = vb.count;
                     invarc = null;
@@ -336,11 +370,11 @@ class GcnoFunction {
                     blcksrc.successCount--;
 
                     if (blcksrc.countValid) {
-                        if (blcksrc.successCount == 1 && !blcksrc.isInvalidChain) {
+                        if (blcksrc.successCount === 1 && !blcksrc.isInvalidChain) {
                             blcksrc.isValidChain = true;
                             validBlocks.push(blcksrc);
                         }
-                    } else if (blcksrc.successCount == 0 && !blcksrc.isInvalidChain) {
+                    } else if (blcksrc.successCount === 0 && !blcksrc.isInvalidChain) {
                         blcksrc.isInvalidChain = true;
                         invalidBlocks.push(blcksrc);
                     }
@@ -369,16 +403,16 @@ class GcdaRecordsParser implements IRecordParser {
     }
 
     public parse(stream: DataInput): void {
-        let magic = 0;
+        let magic: number;
         let gcnoFunction: GcnoFunction | null = null;
         magic = stream.readInt();
 
-        if (magic == this.GCOV_DATA_MAGIC) {
+        if (magic === this.GCOV_DATA_MAGIC) {
             stream.setBigEndian();
         } else {
             magic = (magic >> 16) | (magic << 16);
             magic = ((magic & 0xff00ff) << 8) | ((magic >> 8) & 0xff00ff);
-            if (magic == this.GCOV_DATA_MAGIC) {
+            if (magic === this.GCOV_DATA_MAGIC) {
                 stream.setLittleEndian();
             } else {
                 throw new Error("Unsupported format");
@@ -390,7 +424,7 @@ class GcdaRecordsParser implements IRecordParser {
         while (true) {
             try {
                 const tag = stream.readInt();
-                if (tag == 0) {
+                if (tag === 0) {
                     continue;
                 }
                 const length = stream.readInt();
@@ -426,8 +460,7 @@ class GcdaRecordsParser implements IRecordParser {
                             const exitArcs: Arc[] = block.exitArcs;
                             for (const exitArc of exitArcs) {
                                 if (!exitArc.isOnTree) {
-                                    const arcsCount = stream.readLong();
-                                    exitArc.count = arcsCount;
+                                    exitArc.count = stream.readLong();
                                     exitArc.isValid = true;
                                     block.successCount--;
                                     exitArc.dstBlock.predictionsCount--;
@@ -484,26 +517,26 @@ class GcnoRecordsParser implements IRecordParser {
     private gcnoFunction: GcnoFunction | null = null;
     private gcnoFunctions: GcnoFunction[] = [];
     private sources: SourceFile[];
-    private sourceMap: Map<String, SourceFile>;
+    private sourceMap: Map<string, SourceFile>;
 
-    constructor(sourceMap: Map<String, SourceFile>, sources: SourceFile[]) {
+    constructor(sourceMap: Map<string, SourceFile>, sources: SourceFile[]) {
         this.sourceMap = sourceMap;
         this.sources = sources;
     }
 
     public parse(stream: DataInput): void {
-        let magic = 0;
+        let magic: number;
         let blocks: Block[] | null = null;
         let source: SourceFile | null = null;
         let parseFirstFunction: boolean = false;
 
         magic = stream.readInt();
-        if (magic == this.GCOV_NOTE_MAGIC) {
+        if (magic === this.GCOV_NOTE_MAGIC) {
             stream.setBigEndian();
         } else {
             magic = (magic >> 16) | (magic << 16);
             magic = ((magic & 0xff00ff) << 8) | ((magic >> 8) & 0xff00ff);
-            if (magic == this.GCOV_NOTE_MAGIC) {
+            if (magic === this.GCOV_NOTE_MAGIC) {
                 stream.setLittleEndian();
             } else {
                 throw new Error("Unsupported format");
@@ -517,7 +550,7 @@ class GcnoRecordsParser implements IRecordParser {
                 let tag;
                 while (true) {
                     tag = stream.readInt();
-                    if (tag == this.GCOV_TAG_FUNCTION || tag == this.GCOV_TAG_BLOCKS || tag == this.GCOV_TAG_ARCS || tag == this.GCOV_TAG_LINES)
+                    if (tag === this.GCOV_TAG_FUNCTION || tag === this.GCOV_TAG_BLOCKS || tag === this.GCOV_TAG_ARCS || tag === this.GCOV_TAG_LINES)
                         break;
                 }
                 let length = stream.readInt();
@@ -563,43 +596,59 @@ class GcnoRecordsParser implements IRecordParser {
                             }
                             blocks.push(new Block());
                         }
+                        this.gcnoFunction!.numBlocks = length;
                         break;
                     case this.GCOV_TAG_ARCS:
                         const srcBlockIdx = stream.readInt();
-                        const block = blocks![srcBlockIdx];
                         const arcs: Arc[] = [];
                         for (let i = 0; i < (length - 1) / 2; i++) {
                             const dstBlockIdx = stream.readInt();
                             const flag = stream.readInt();
                             const arc = new Arc(srcBlockIdx, dstBlockIdx, flag, blocks!);
-                            arc.dstBlock.entryArcs.push(arc);
-                            arc.dstBlock.predictionsCount++;
                             arcs.push(arc);
+                        }
+                        let block = blocks![srcBlockIdx];
+                        for (const arc of arcs) {
                             block.exitArcs.push(arc);
                             block.successCount++;
+                            arc.dstBlock.entryArcs.push(arc);
+                            arc.dstBlock.predictionsCount++;
+                            if (arc.isFake) {
+                                if (arc.srcBlock != null) {
+                                    block = blocks![srcBlockIdx];
+                                    block.isCallSite = true;
+                                }
+                            }
                         }
                         this.gcnoFunction!.functionBlocks = blocks!;
                         break;
                     case this.GCOV_TAG_LINES:
                         const blockNumber = stream.readInt();
                         const lineNumbers: number[] = [];
+                        let index: number = 0;
                         while (true) {
                             const lineNumber = stream.readInt();
-                            if (lineNumber == 0) {
-                                const fileName = stream.readString();
-                                if (fileName === "") {
-                                    break;
+                            if (lineNumber !== 0) {
+                                if (index === 0) {
+                                    lineNumbers[index++] = 0;
+                                    lineNumbers[index++] = source!.index;
                                 }
-                                source = this.findOrAdd(fileName);
-                            } else {
-                                lineNumbers.push(lineNumber);
+                                lineNumbers[index++] = lineNumber;
                                 if (lineNumber >= source!.linesCount) {
                                     source!.linesCount = lineNumber + 1;
                                 }
+                            } else {
+                                const fileName = stream.readString();
+                                if (fileName === '') {
+                                    break;
+                                }
+                                source = this.findOrAdd(fileName);
+                                lineNumbers[index++] = 0;
+                                lineNumbers[index++] = source!.index;
                             }
                         }
-                        this.gcnoFunction!.functionBlocks[blockNumber].lineNumbers = lineNumbers;
-                        this.gcnoFunction!.functionBlocks[blockNumber].sourceIndex = source!.index;
+                        this.gcnoFunction!.functionBlocks[blockNumber].blockLines = lineNumbers;
+                        this.gcnoFunction!.functionBlocks[blockNumber].lineNumber = index;
                         break;
                     default: {
                         break;

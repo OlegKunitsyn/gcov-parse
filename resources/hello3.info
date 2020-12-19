@@ -5,7 +5,7 @@ DA:7,2
 DA:8,1
 DA:9,1
 end_of_record
-SF:/home/olegs/projects/gnucobol-debug/test/resources/hello3.c
+SF:hello3.c
 FN:31,main
 FNDA:1,main
 FN:44,hello3
@@ -35,7 +35,7 @@ DA:78,1
 DA:79,1
 DA:82,1
 DA:83,1
-DA:85,0
+DA:85,1
 DA:88,1
 DA:91,1
 DA:96,1
