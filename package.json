@@ -1,8 +1,9 @@
 {
   "name": "gcov-parse",
-  "version": "1.0.1",
+  "version": "1.1.2",
   "description": "Parse GCOV .gcda and .gcno files",
   "main": "out/src/gcov.js",
+  "types": "./out/src/gcov.d.ts",
   "scripts": {
     "build": "tsc",
     "lint": "tslint -p tsconfig.json",
